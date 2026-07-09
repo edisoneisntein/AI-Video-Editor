@@ -367,16 +367,29 @@ class VideoRenderer:
     ):
         """
         Concatenation with xfade transitions between clips.
-        Chains xfade filters sequentially for each pair.
+        
+        FIX: Offsets must be strictly increasing for FFmpeg xfade.
+        We clamp transition duration to min(t_duration, clip_duration * 0.4)
+        so a transition never exceeds 40% of the clip it's attached to.
+        Also ensures offset > previous_offset always.
         """
-        # Get duration of each processed clip
+        # Get actual durations of processed clips
         durations = [self._get_video_duration(clip) for clip in clips]
 
-        # Build the filter_complex graph
-        # Strategy: chain xfade between sequential pairs
+        # Validate and clamp transition durations to prevent offset inversion
+        safe_transitions = []
+        for i, seg in enumerate(segments):
+            t_dur = seg.transition_out.duration
+            # Clamp: transition can be at most 40% of the shorter of the two clips
+            if i < len(durations) - 1:
+                clip_a = durations[i]
+                clip_b = durations[i + 1] if i + 1 < len(durations) else clip_a
+                max_allowed = min(clip_a, clip_b) * 0.4
+                t_dur = min(t_dur, max(max_allowed, 0.1))
+            safe_transitions.append(t_dur)
+
         n_clips = len(clips)
 
-        # Build inputs
         cmd = [self.ffmpeg, "-y"]
         for clip_path in clips:
             cmd.extend(["-i", clip_path])
@@ -384,7 +397,11 @@ class VideoRenderer:
         filter_parts = []
         current_video = "[0:v]"
         current_audio = "[0:a]"
-        accumulated_offset = durations[0]
+
+        # Track the running position in output timeline
+        # timeline_pos = end of last clip's NON-overlapping content
+        timeline_pos = durations[0]
+        last_offset = 0.0
 
         for i in range(1, n_clips):
             next_video = f"[{i}:v]"
@@ -392,49 +409,48 @@ class VideoRenderer:
             out_video = f"[vfade{i}]" if i < n_clips - 1 else "[vout]"
             out_audio = f"[afade{i}]" if i < n_clips - 1 else "[aout]"
 
-            transition = segments[i - 1].transition_out
-            t_duration = transition.duration
+            t_duration = safe_transitions[i - 1]
 
-            # Calculate offset (where in the output timeline the transition starts)
-            offset = accumulated_offset - t_duration
+            # Offset = where in the output timeline the xfade starts
+            # Must be strictly > last_offset
+            offset = timeline_pos - t_duration
+            offset = max(offset, last_offset + 0.01)  # guarantee strictly increasing
 
-            # Video transition using xfade
-            xfade_type = self._transition_to_xfade(transition.type)
+            xfade_type = self._transition_to_xfade(segments[i - 1].transition_out.type)
             filter_parts.append(
                 f"{current_video}{next_video}xfade=transition={xfade_type}"
                 f":duration={t_duration:.3f}:offset={offset:.3f}{out_video}"
             )
 
-            # Audio transition — with ducking for J/L cuts
+            # Audio transition
+            transition = segments[i - 1].transition_out
             if transition.type in (TransitionType.J_CUT, TransitionType.L_CUT):
-                # J-cut: audio B enters early, duck audio A down
-                # L-cut: audio A continues, duck audio B down initially
-                duck_duration = max(t_duration, transition.audio_overlap, 0.5)
-
+                duck_dur = min(
+                    max(t_duration, transition.audio_overlap, 0.3),
+                    min(durations[i - 1], durations[i]) * 0.4,
+                )
                 if transition.type == TransitionType.J_CUT:
-                    # A ducks down with exp curve, B enters with log curve (B dominates early)
                     filter_parts.append(
-                        f"{current_audio}{next_audio}acrossfade=d={duck_duration:.3f}"
+                        f"{current_audio}{next_audio}acrossfade=d={duck_dur:.3f}"
                         f":c1=exp:c2=log{out_audio}"
                     )
                 else:
-                    # L-cut: A stays strong (log fade out), B enters softly (exp fade in)
                     filter_parts.append(
-                        f"{current_audio}{next_audio}acrossfade=d={duck_duration:.3f}"
+                        f"{current_audio}{next_audio}acrossfade=d={duck_dur:.3f}"
                         f":c1=log:c2=exp{out_audio}"
                     )
             else:
-                # Standard symmetric crossfade for other transitions
                 filter_parts.append(
                     f"{current_audio}{next_audio}acrossfade=d={t_duration:.3f}"
                     f":c1=tri:c2=tri{out_audio}"
                 )
 
-            # Update for next iteration
+            # Advance timeline position
+            last_offset = offset
+            timeline_pos = offset + durations[i]
+
             current_video = out_video
             current_audio = out_audio
-            # Next accumulated offset: previous + new clip duration - transition overlap
-            accumulated_offset = offset + durations[i]
 
         filter_complex = ";\n".join(filter_parts)
 
@@ -496,10 +512,43 @@ class VideoRenderer:
                 cmd, capture_output=True, text=True, check=True, timeout=30
             )
             info = json.loads(result.stdout)
-            return float(info["format"]["duration"])
-        except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError) as e:
+            duration = float(info["format"]["duration"])
+            if duration > 0:
+                return duration
+        except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError, ValueError) as e:
             logger.warning(f"Could not get duration for {video_path}: {e}")
-            return 10.0  # Fallback duration
+
+        # Fallback: try with -show_streams
+        try:
+            cmd2 = [
+                self.ffprobe, "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams", "-select_streams", "v:0",
+                video_path,
+            ]
+            result = subprocess.run(
+                cmd2, capture_output=True, text=True, check=True, timeout=15
+            )
+            info = json.loads(result.stdout)
+            streams = info.get("streams", [])
+            if streams:
+                dur = streams[0].get("duration")
+                if dur:
+                    return float(dur)
+                # Calculate from nb_frames / fps
+                nb_frames = streams[0].get("nb_frames")
+                fps_str = streams[0].get("r_frame_rate", "24/1")
+                if nb_frames and "/" in fps_str:
+                    num, den = fps_str.split("/")
+                    fps = float(num) / float(den)
+                    if fps > 0:
+                        return int(nb_frames) / fps
+        except Exception:
+            pass
+
+        # Last resort: conservative 3 second fallback (not 10)
+        logger.error(f"Duration detection failed completely for {video_path}, using 3.0s fallback")
+        return 3.0
 
     def _parse_timecode(self, timecode) -> float:
         """
