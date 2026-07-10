@@ -223,7 +223,7 @@ async def upload_videos(
 # ─── Analyze Endpoint (Protected) ───────────────────────────────────────────────
 
 
-@app.post("/api/analyze", response_model=AnalyzeResponse)
+@app.post("/api/analyze")
 @limiter.limit("5/minute")
 async def analyze_videos(
     request: Request,
@@ -231,18 +231,20 @@ async def analyze_videos(
     _key: str = Depends(require_api_key),
 ):
     """
-    Send uploaded videos to Gemini for analysis.
-    Returns a structured edit plan JSON.
+    Start video analysis in background. Returns immediately with task_id.
+    Poll GET /api/task/{task_id} for progress and result.
 
     Requires X-API-Key header.
     """
+    from backend.background import create_task
+
     s = get_settings()
     store = get_store()
 
     # Validate project exists
     project = store.get_project(body.project_id)
     if not project:
-        raise HTTPException(status_code=404, detail=f"Project not found")
+        raise HTTPException(status_code=404, detail="Project not found")
 
     # Get video file paths
     project_dir = project["project_dir"]
@@ -269,9 +271,7 @@ async def analyze_videos(
         tpl_store = get_template_store()
         template = tpl_store.get(body.template_id)
         if not template:
-            raise HTTPException(status_code=404, detail=f"Template '{body.template_id}' not found")
-
-        # Override with template values
+            raise HTTPException(status_code=404, detail=f"Template not found")
         genre = template.genre
         rhythm = template.rhythm
         reference = template.reference
@@ -279,18 +279,21 @@ async def analyze_videos(
         duration_target = template.duration_target
         additional_instructions = template.additional_instructions
         provider_name = template.provider
-
-        # Increment usage counter
         tpl_store.increment_use_count(body.template_id)
-        logger.info(f"Applying template '{template.name}' to analysis")
 
     # Update status
     store.update_status(body.project_id, ProjectStatus.ANALYZING)
-    logger.info(f"Analyzing project {body.project_id} ({len(video_paths)} clips)...")
 
-    try:
-        # ── Get AI provider and analyze directly ──
+    # Launch background task
+    def _run_analysis(task_info=None):
+        """Runs in background thread."""
+        if task_info:
+            task_info.progress = f"Connecting to AI provider ({provider_name})..."
+
         provider = get_provider(provider_name)
+
+        if task_info:
+            task_info.progress = f"Uploading {len(video_paths)} clips to {provider.name}..."
 
         analysis_req = AnalysisRequest(
             video_paths=video_paths,
@@ -302,45 +305,51 @@ async def analyze_videos(
             additional_instructions=additional_instructions,
         )
 
-        # Run analysis (provider uploads videos and gets edit plan)
         result = provider.analyze_videos(analysis_req)
 
-        # Store edit plan
+        if task_info:
+            task_info.progress = "Saving edit plan..."
+
+        # Persist result
         store.update_edit_plan(body.project_id, result.edit_plan)
 
-        # Save edit plan to file for reference
         plan_path = os.path.join(project_dir, "edit_plan.json")
         with open(plan_path, "w", encoding="utf-8") as f:
             json.dump(result.edit_plan, f, indent=2, ensure_ascii=False)
 
-        logger.info(
-            f"Analysis complete for {body.project_id} "
-            f"({result.processing_time:.1f}s, {result.tokens_output} tokens out)"
-        )
+        return {
+            "project_id": body.project_id,
+            "status": "analyzed",
+            "edit_plan": result.edit_plan,
+            "model_used": result.model_used,
+            "provider": result.provider,
+            "tokens_input": result.tokens_input,
+            "tokens_output": result.tokens_output,
+            "processing_time": round(result.processing_time, 2),
+        }
 
-        return AnalyzeResponse(
-            project_id=body.project_id,
-            status=ProjectStatus.ANALYZED,
-            edit_plan=result.edit_plan,
-            model_used=result.model_used,
-            tokens_input=result.tokens_input,
-            tokens_output=result.tokens_output,
-            processing_time=round(result.processing_time, 2),
-            message="Analysis complete. Edit plan generated. Ready to render.",
-        )
+    task_id = create_task(
+        task_type="analyze",
+        project_id=body.project_id,
+        target=_run_analysis,
+    )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        store.update_status(body.project_id, ProjectStatus.FAILED)
-        logger.error(f"Analysis failed for {body.project_id}: {type(e).__name__}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {type(e).__name__}: {str(e)[:200]}")
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id,
+            "project_id": body.project_id,
+            "status": "accepted",
+            "message": "Analysis started. Poll GET /api/task/{task_id} for progress.",
+            "poll_url": f"/api/task/{task_id}",
+        },
+    )
 
 
 # ─── Render Endpoint (Protected) ────────────────────────────────────────────────
 
 
-@app.post("/api/render", response_model=RenderResponse)
+@app.post("/api/render")
 @limiter.limit("3/minute")
 async def render_video(
     request: Request,
@@ -348,34 +357,28 @@ async def render_video(
     _key: str = Depends(require_api_key),
 ):
     """
-    Render the final video using the edit plan.
-    Uses FFmpeg to cut, transform, apply transitions, and assemble clips.
+    Start video render in background. Returns immediately with task_id.
+    Poll GET /api/task/{task_id} for progress and result.
 
     Requires X-API-Key header.
     """
+    from backend.background import create_task
+
     s = get_settings()
     store = get_store()
 
-    # Validate project
     project = store.get_project(body.project_id)
     if not project:
-        raise HTTPException(status_code=404, detail=f"Project not found")
+        raise HTTPException(status_code=404, detail="Project not found")
 
-    # Get edit plan (from body or stored)
     edit_plan = body.edit_plan or project.get("edit_plan")
     if not edit_plan:
-        raise HTTPException(
-            status_code=400,
-            detail="No edit plan available. Run /api/analyze first or provide edit_plan in request.",
-        )
+        raise HTTPException(status_code=400, detail="No edit plan available. Run /api/analyze first.")
 
     # Concurrency check
     active_renders = store.count_active_renders()
     if active_renders >= s.max_concurrent_renders:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Server is busy. {active_renders} render(s) in progress. Max: {s.max_concurrent_renders}. Try again later.",
-        )
+        raise HTTPException(status_code=429, detail="Server busy. Try again later.")
 
     # Build source video mapping
     project_dir = project["project_dir"]
@@ -384,8 +387,7 @@ async def render_video(
         filepath = os.path.join(project_dir, filename)
         if os.path.exists(filepath):
             source_videos[filename] = filepath
-            stem = Path(filename).stem
-            source_videos[stem] = filepath
+            source_videos[Path(filename).stem] = filepath
 
     if not source_videos:
         raise HTTPException(status_code=400, detail="No source video files found")
@@ -396,73 +398,95 @@ async def render_video(
     except ValueError:
         width, height = 1920, 1080
 
-    # Configure render
     render_config = RenderConfig(
-        width=width,
-        height=height,
-        fps=body.fps,
-        codec=body.codec,
-        preset=body.preset,
-        crf=body.crf,
+        width=width, height=height, fps=body.fps,
+        codec=body.codec, preset=body.preset, crf=body.crf,
     )
 
-    # Output path
     output_filename = f"{body.project_id}_final.mp4"
     output_path = os.path.join(s.output_dir, output_filename)
 
-    # Update status
     store.update_status(body.project_id, ProjectStatus.RENDERING)
-    logger.info(f"Rendering project {body.project_id}...")
 
-    # Initialize renderer OUTSIDE try for cleanup in finally
-    temp_dir = os.path.join(s.temp_dir, body.project_id)
-    renderer = VideoRenderer(
-        ffmpeg_path=s.ffmpeg_path,
-        ffprobe_path=s.ffprobe_path,
-        temp_dir=temp_dir,
+    # Launch background task
+    def _run_render(task_info=None):
+        """Runs in background thread."""
+        temp_dir = os.path.join(s.temp_dir, body.project_id)
+        renderer = VideoRenderer(
+            ffmpeg_path=s.ffmpeg_path,
+            ffprobe_path=s.ffprobe_path,
+            temp_dir=temp_dir,
+        )
+
+        try:
+            if task_info:
+                task_info.progress = "Processing clips..."
+
+            start_time = time.time()
+
+            renderer.render(
+                edit_plan=edit_plan,
+                source_videos=source_videos,
+                output_path=output_path,
+                config=render_config,
+            )
+
+            render_time = time.time() - start_time
+            output_size = os.path.getsize(output_path) / (1024 * 1024)
+
+            store.update_output(body.project_id, output_path, output_filename)
+
+            return {
+                "project_id": body.project_id,
+                "status": "completed",
+                "output_filename": output_filename,
+                "output_size_mb": round(output_size, 2),
+                "render_time": round(render_time, 2),
+                "download_url": f"/api/download/{body.project_id}",
+            }
+        except Exception as e:
+            store.update_status(body.project_id, ProjectStatus.FAILED)
+            raise
+        finally:
+            renderer.cleanup()
+
+    task_id = create_task(
+        task_type="render",
+        project_id=body.project_id,
+        target=_run_render,
     )
 
-    try:
-        start_time = time.time()
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id,
+            "project_id": body.project_id,
+            "status": "accepted",
+            "message": "Render started. Poll GET /api/task/{task_id} for progress.",
+            "poll_url": f"/api/task/{task_id}",
+        },
+    )
 
-        # Render
-        renderer.render(
-            edit_plan=edit_plan,
-            source_videos=source_videos,
-            output_path=output_path,
-            config=render_config,
-        )
 
-        render_time = time.time() - start_time
-        output_size = os.path.getsize(output_path) / (1024 * 1024)
+# ─── Task Polling Endpoint ───────────────────────────────────────────────────────
 
-        # Update project in store
-        store.update_output(body.project_id, output_path, output_filename)
 
-        logger.info(
-            f"Render complete: {output_filename} "
-            f"({output_size:.1f} MB, {render_time:.1f}s)"
-        )
+@app.get("/api/task/{task_id}")
+async def get_task_status(
+    task_id: str,
+    _key: str = Depends(require_api_key),
+):
+    """
+    Poll the status of a background task (analyze or render).
+    Returns current status, progress message, and result when complete.
+    """
+    from backend.background import get_task
 
-        return RenderResponse(
-            project_id=body.project_id,
-            status=ProjectStatus.COMPLETED,
-            output_filename=output_filename,
-            output_size_mb=round(output_size, 2),
-            render_time=round(render_time, 2),
-            download_url=f"/api/download/{body.project_id}",
-            message=f"Render complete! {output_size:.1f} MB video ready for download.",
-        )
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        store.update_status(body.project_id, ProjectStatus.FAILED)
-        logger.error(f"Render failed for {body.project_id}: {type(e).__name__}")
-        raise HTTPException(status_code=500, detail=f"Render failed: {type(e).__name__}")
-    finally:
-        # ALWAYS cleanup temp files, regardless of success or failure
-        renderer.cleanup()
+    return JSONResponse(content=task.to_dict())
 
 
 # ─── Download Endpoint (Protected) ──────────────────────────────────────────────

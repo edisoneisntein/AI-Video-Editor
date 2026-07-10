@@ -355,45 +355,73 @@ if st.session_state.project_id:
     # Analyze button
     st.markdown("")
     if st.button("Analyze with AI", type="primary", use_container_width=True):
-        with st.spinner("AI is analyzing your videos... This may take 1-3 minutes."):
-            payload = {
-                "project_id": st.session_state.project_id,
-                "genre": genre,
-                "rhythm": rhythm,
-                "reference": reference,
-                "tone": tone,
-                "duration_target": duration_target,
-                "additional_instructions": additional,
-                "provider": provider_choice,
-            }
-            # Include template_id if one was selected
-            if tpl_id:
-                payload["template_id"] = tpl_id
+        payload = {
+            "project_id": st.session_state.project_id,
+            "genre": genre,
+            "rhythm": rhythm,
+            "reference": reference,
+            "tone": tone,
+            "duration_target": duration_target,
+            "additional_instructions": additional,
+            "provider": provider_choice,
+        }
+        if tpl_id:
+            payload["template_id"] = tpl_id
 
-            resp = api_call("post", "/api/analyze", json=payload)
+        resp = api_call("post", "/api/analyze", json=payload)
 
-            if resp and resp.status_code == 200:
-                data = resp.json()
-                st.session_state.edit_plan = data["edit_plan"]
-                st.session_state.status = data["status"]
+        if resp and resp.status_code == 202:
+            task_data = resp.json()
+            task_id = task_data["task_id"]
+            st.info(f"Analysis started (task: {task_id}). Waiting for AI...")
 
-                # Show metrics
-                mcol1, mcol2, mcol3 = st.columns(3)
-                with mcol1:
-                    st.metric("Processing Time", f"{data['processing_time']}s")
-                with mcol2:
-                    st.metric("Tokens In", f"{data['tokens_input']:,}")
-                with mcol3:
-                    st.metric("Tokens Out", f"{data['tokens_output']:,}")
+            # Poll until complete
+            progress_bar = st.progress(0, text="Connecting to AI...")
+            poll_count = 0
+            max_polls = 200  # 200 × 3s = 10 min max
 
-                st.success(data["message"])
-                st.rerun()
-            elif resp:
-                try:
-                    detail = resp.json().get("detail", resp.text)
-                except Exception:
-                    detail = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
-                st.error(f"Analysis failed: {detail}")
+            while poll_count < max_polls:
+                time.sleep(3)
+                poll_count += 1
+
+                status_resp = api_call("get", f"/api/task/{task_id}")
+                if not status_resp or status_resp.status_code != 200:
+                    continue
+
+                task_status = status_resp.json()
+                progress_text = task_status.get("progress", "Processing...")
+                elapsed = task_status.get("elapsed", 0)
+                progress_bar.progress(
+                    min(poll_count / 60, 0.95),
+                    text=f"{progress_text} ({elapsed:.0f}s)",
+                )
+
+                if task_status["status"] == "completed":
+                    result = task_status["result"]
+                    st.session_state.edit_plan = result.get("edit_plan")
+                    st.session_state.status = "analyzed"
+                    progress_bar.progress(1.0, text="Complete!")
+                    st.success(
+                        f"Analysis complete in {result.get('processing_time', 0)}s "
+                        f"using {result.get('provider', 'AI')}"
+                    )
+                    st.rerun()
+                    break
+
+                elif task_status["status"] == "failed":
+                    progress_bar.empty()
+                    st.error(f"Analysis failed: {task_status.get('error', 'Unknown error')}")
+                    break
+            else:
+                progress_bar.empty()
+                st.error("Analysis timed out after 10 minutes. Check backend logs.")
+
+        elif resp:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
+            st.error(f"Analysis failed: {detail}")
 
 # ─── Step 3: View Edit Plan ─────────────────────────────────────────────────────
 
@@ -554,33 +582,66 @@ if st.session_state.edit_plan:
                            help="Lower = better quality, larger file. 18 is visually lossless.")
 
     if st.button("Render Video", type="primary", use_container_width=True):
-        with st.spinner("Rendering video with FFmpeg... This may take a while."):
-            payload = {
-                "project_id": st.session_state.project_id,
-                "edit_plan": st.session_state.edit_plan,
-                "resolution": resolution,
-                "fps": fps,
-                "crf": quality,
-            }
+        payload = {
+            "project_id": st.session_state.project_id,
+            "edit_plan": st.session_state.edit_plan,
+            "resolution": resolution,
+            "fps": fps,
+            "crf": quality,
+        }
 
-            resp = api_call("post", "/api/render", json=payload)
+        resp = api_call("post", "/api/render", json=payload)
 
-            if resp and resp.status_code == 200:
-                data = resp.json()
-                st.session_state.status = data["status"]
+        if resp and resp.status_code == 202:
+            task_data = resp.json()
+            task_id = task_data["task_id"]
+            st.info(f"Render started (task: {task_id}). FFmpeg is working...")
 
-                st.success(data["message"])
+            progress_bar = st.progress(0, text="Processing clips...")
+            poll_count = 0
+            max_polls = 300  # 300 × 3s = 15 min max
 
-                # Metrics
-                mcol1, mcol2 = st.columns(2)
-                with mcol1:
-                    st.metric("Render Time", f"{data['render_time']}s")
-                with mcol2:
-                    st.metric("Output Size", f"{data['output_size_mb']} MB")
+            while poll_count < max_polls:
+                time.sleep(3)
+                poll_count += 1
 
-                st.rerun()
-            elif resp:
-                st.error(f"Render failed: {resp.json().get('detail', resp.text)}")
+                status_resp = api_call("get", f"/api/task/{task_id}")
+                if not status_resp or status_resp.status_code != 200:
+                    continue
+
+                task_status = status_resp.json()
+                progress_text = task_status.get("progress", "Rendering...")
+                elapsed = task_status.get("elapsed", 0)
+                progress_bar.progress(
+                    min(poll_count / 100, 0.95),
+                    text=f"{progress_text} ({elapsed:.0f}s)",
+                )
+
+                if task_status["status"] == "completed":
+                    result = task_status["result"]
+                    st.session_state.status = "completed"
+                    progress_bar.progress(1.0, text="Render complete!")
+                    st.success(
+                        f"Render complete! {result.get('output_size_mb', 0)} MB "
+                        f"in {result.get('render_time', 0)}s"
+                    )
+                    st.rerun()
+                    break
+
+                elif task_status["status"] == "failed":
+                    progress_bar.empty()
+                    st.error(f"Render failed: {task_status.get('error', 'Unknown')}")
+                    break
+            else:
+                progress_bar.empty()
+                st.error("Render timed out. Check backend logs.")
+
+        elif resp:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text[:200] if resp.text else f"HTTP {resp.status_code}"
+            st.error(f"Render failed: {detail}")
 
 # ─── Step 6: Download ───────────────────────────────────────────────────────────
 
