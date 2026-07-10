@@ -311,7 +311,18 @@ Sin texto adicional, sin markdown."""
             return 10.0
 
     def _parse_json(self, text: str) -> dict:
+        """Parse JSON with normalization for Spanish-language model responses."""
         text = text.strip()
+
+        # ── Normalize Spanish boolean/keyword responses ──
+        # Models sometimes output Spanish words instead of JSON literals
+        text = re.sub(r'\b[Ff]also\b', 'false', text)
+        text = re.sub(r'\b[Vv]erdadero\b', 'true', text)
+        text = re.sub(r'\b[Nn]ulo\b', 'null', text)
+        # Fix Spanish key names that should be standard
+        text = text.replace('"desvanecimiento"', '"fade_out"')
+        text = text.replace('"fundido_entrada"', '"fade_in"')
+
         try:
             return json.loads(text)
         except json.JSONDecodeError:
