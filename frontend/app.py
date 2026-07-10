@@ -28,49 +28,6 @@ st.set_page_config(
 
 # ─── Custom CSS ─────────────────────────────────────────────────────────────────
 
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        color: #1a1a2e;
-        margin-bottom: 0.5rem;
-    }
-    .sub-header {
-        font-size: 1.1rem;
-        color: #555;
-        margin-bottom: 2rem;
-    }
-    .status-badge {
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-size: 0.85rem;
-        font-weight: 600;
-        display: inline-block;
-    }
-    .status-uploaded { background: #e3f2fd; color: #1565c0; }
-    .status-analyzing { background: #fff3e0; color: #e65100; }
-    .status-analyzed { background: #e8f5e9; color: #2e7d32; }
-    .status-rendering { background: #fce4ec; color: #c62828; }
-    .status-completed { background: #e8f5e9; color: #1b5e20; }
-    .status-failed { background: #ffebee; color: #b71c1c; }
-    .timeline-clip {
-        background: #f5f5f5;
-        border-left: 4px solid #1976d2;
-        padding: 1rem;
-        margin: 0.5rem 0;
-        border-radius: 4px;
-    }
-    .metric-card {
-        background: #fafafa;
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-        border: 1px solid #eee;
-    }
-</style>
-""", unsafe_allow_html=True)
-
 # ─── Session State Init ─────────────────────────────────────────────────────────
 
 if "project_id" not in st.session_state:
@@ -165,11 +122,8 @@ with st.sidebar:
 
 # ─── Main Content ───────────────────────────────────────────────────────────────
 
-st.markdown('<p class="main-header">AI Video Editor</p>', unsafe_allow_html=True)
-st.markdown(
-    '<p class="sub-header">Upload clips, let Gemini design the edit, render with FFmpeg</p>',
-    unsafe_allow_html=True,
-)
+st.title("AI Video Editor")
+st.caption("Upload clips, let AI design the edit, render with FFmpeg")
 
 # ─── Step 1: Upload ─────────────────────────────────────────────────────────────
 
@@ -436,14 +390,11 @@ if st.session_state.edit_plan:
 
             with st.container():
                 st.markdown(
-                    f'<div class="timeline-clip">'
-                    f'<strong>#{i + 1} - {clip_id}</strong><br>'
-                    f'<small>IN: {format_timecode(float(tc_in))} '
-                    f'| OUT: {format_timecode(float(tc_out))} '
-                    f'| Transition: {transition}</small><br>'
-                    f'<em>{justification}</em>'
-                    f'</div>',
-                    unsafe_allow_html=True,
+                    f"**#{i + 1} - {clip_id}**  \n"
+                    f"IN: {format_timecode(float(tc_in))} "
+                    f"| OUT: {format_timecode(float(tc_out))} "
+                    f"| Transition: {transition}  \n"
+                    f"_{justification}_"
                 )
 
                 if transform and transform.get("tipo", "ninguna") != "ninguna":
