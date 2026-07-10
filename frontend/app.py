@@ -373,48 +373,10 @@ if st.session_state.project_id:
         if resp and resp.status_code == 202:
             task_data = resp.json()
             task_id = task_data["task_id"]
-            st.info(f"Analysis started (task: {task_id}). Waiting for AI...")
-
-            # Poll until complete
-            progress_bar = st.progress(0, text="Connecting to AI...")
-            poll_count = 0
-            max_polls = 200  # 200 × 3s = 10 min max
-
-            while poll_count < max_polls:
-                time.sleep(3)
-                poll_count += 1
-
-                status_resp = api_call("get", f"/api/task/{task_id}")
-                if not status_resp or status_resp.status_code != 200:
-                    continue
-
-                task_status = status_resp.json()
-                progress_text = task_status.get("progress", "Processing...")
-                elapsed = task_status.get("elapsed", 0)
-                progress_bar.progress(
-                    min(poll_count / 60, 0.95),
-                    text=f"{progress_text} ({elapsed:.0f}s)",
-                )
-
-                if task_status["status"] == "completed":
-                    result = task_status["result"]
-                    st.session_state.edit_plan = result.get("edit_plan")
-                    st.session_state.status = "analyzed"
-                    progress_bar.progress(1.0, text="Complete!")
-                    st.success(
-                        f"Analysis complete in {result.get('processing_time', 0)}s "
-                        f"using {result.get('provider', 'AI')}"
-                    )
-                    st.rerun()
-                    break
-
-                elif task_status["status"] == "failed":
-                    progress_bar.empty()
-                    st.error(f"Analysis failed: {task_status.get('error', 'Unknown error')}")
-                    break
-            else:
-                progress_bar.empty()
-                st.error("Analysis timed out after 10 minutes. Check backend logs.")
+            st.session_state["active_task"] = task_id
+            st.session_state["task_type"] = "analyze"
+            st.success(f"Analysis started. Task: {task_id}")
+            st.rerun()
 
         elif resp:
             try:
@@ -422,6 +384,33 @@ if st.session_state.project_id:
             except Exception:
                 detail = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
             st.error(f"Analysis failed: {detail}")
+
+# ── Task polling (outside the button block) ──
+if st.session_state.get("active_task") and st.session_state.get("task_type") == "analyze":
+    task_id = st.session_state["active_task"]
+    status_resp = api_call("get", f"/api/task/{task_id}")
+
+    if status_resp and status_resp.status_code == 200:
+        task_status = status_resp.json()
+
+        if task_status["status"] == "completed":
+            result = task_status["result"]
+            st.session_state.edit_plan = result.get("edit_plan")
+            st.session_state.status = "analyzed"
+            st.session_state.pop("active_task", None)
+            st.session_state.pop("task_type", None)
+            st.success(f"Analysis complete in {result.get('processing_time', 0)}s using {result.get('provider', 'AI')}")
+            st.rerun()
+
+        elif task_status["status"] == "failed":
+            st.session_state.pop("active_task", None)
+            st.session_state.pop("task_type", None)
+            st.error(f"Analysis failed: {task_status.get('error', 'Unknown')}")
+
+        elif task_status["status"] in ("running", "pending"):
+            st.info(f"Analyzing... {task_status.get('progress', '')} ({task_status.get('elapsed', 0):.0f}s)")
+            time.sleep(4)
+            st.rerun()
 
 # ─── Step 3: View Edit Plan ─────────────────────────────────────────────────────
 
@@ -595,46 +584,10 @@ if st.session_state.edit_plan:
         if resp and resp.status_code == 202:
             task_data = resp.json()
             task_id = task_data["task_id"]
-            st.info(f"Render started (task: {task_id}). FFmpeg is working...")
-
-            progress_bar = st.progress(0, text="Processing clips...")
-            poll_count = 0
-            max_polls = 300  # 300 × 3s = 15 min max
-
-            while poll_count < max_polls:
-                time.sleep(3)
-                poll_count += 1
-
-                status_resp = api_call("get", f"/api/task/{task_id}")
-                if not status_resp or status_resp.status_code != 200:
-                    continue
-
-                task_status = status_resp.json()
-                progress_text = task_status.get("progress", "Rendering...")
-                elapsed = task_status.get("elapsed", 0)
-                progress_bar.progress(
-                    min(poll_count / 100, 0.95),
-                    text=f"{progress_text} ({elapsed:.0f}s)",
-                )
-
-                if task_status["status"] == "completed":
-                    result = task_status["result"]
-                    st.session_state.status = "completed"
-                    progress_bar.progress(1.0, text="Render complete!")
-                    st.success(
-                        f"Render complete! {result.get('output_size_mb', 0)} MB "
-                        f"in {result.get('render_time', 0)}s"
-                    )
-                    st.rerun()
-                    break
-
-                elif task_status["status"] == "failed":
-                    progress_bar.empty()
-                    st.error(f"Render failed: {task_status.get('error', 'Unknown')}")
-                    break
-            else:
-                progress_bar.empty()
-                st.error("Render timed out. Check backend logs.")
+            st.session_state["active_task"] = task_id
+            st.session_state["task_type"] = "render"
+            st.success(f"Render started. Task: {task_id}")
+            st.rerun()
 
         elif resp:
             try:
@@ -642,6 +595,32 @@ if st.session_state.edit_plan:
             except Exception:
                 detail = resp.text[:200] if resp.text else f"HTTP {resp.status_code}"
             st.error(f"Render failed: {detail}")
+
+# ── Render task polling ──
+if st.session_state.get("active_task") and st.session_state.get("task_type") == "render":
+    task_id = st.session_state["active_task"]
+    status_resp = api_call("get", f"/api/task/{task_id}")
+
+    if status_resp and status_resp.status_code == 200:
+        task_status = status_resp.json()
+
+        if task_status["status"] == "completed":
+            result = task_status["result"]
+            st.session_state.status = "completed"
+            st.session_state.pop("active_task", None)
+            st.session_state.pop("task_type", None)
+            st.success(f"Render complete! {result.get('output_size_mb', 0)} MB in {result.get('render_time', 0)}s")
+            st.rerun()
+
+        elif task_status["status"] == "failed":
+            st.session_state.pop("active_task", None)
+            st.session_state.pop("task_type", None)
+            st.error(f"Render failed: {task_status.get('error', 'Unknown')}")
+
+        elif task_status["status"] in ("running", "pending"):
+            st.info(f"Rendering... {task_status.get('progress', '')} ({task_status.get('elapsed', 0):.0f}s)")
+            time.sleep(4)
+            st.rerun()
 
 # ─── Step 6: Download ───────────────────────────────────────────────────────────
 
